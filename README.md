@@ -9,12 +9,12 @@ source of aliasing, so they work together without blurring the same edge twice.
 
 | # | Layer | Fixes | Status |
 |---|---|---|---|
-| 1 | **CMAA2** (Intel) | geometric edges, every frame, no history | Phase 1, planned |
-| 2 | **Class-weighted TAA** | temporal shimmer on scenery, but no history on your aircraft or cockpit screens | Phase 1, planned |
-| 3 | **Wire AA** (Persson) | power lines and cables breaking into dots | Phase 2 |
-| 4 | **Light-point AA** | flickering runway and city lights | Phase 3 |
-| 5 | **Geometric specular AA** (Tokuyoshi & Kaplanyan) | sparkle on water, metal, wet runways | Phase 4 |
-| 6 | **Anti-aliased alpha test** (Golus) | crawling foliage and fences | Phase 5 |
+| 1 | **CMAA2** (Intel) | geometric edges, every frame, no history | Done |
+| 2 | **Class-weighted TAA** | temporal shimmer on scenery, but no history on your aircraft or cockpit screens | Done |
+| 3 | **Wire AA** (Persson) | power lines and cables breaking into dots | Done |
+| 4 | **Light-point AA** | flickering runway and city lights | Done |
+| 5 | **Geometric specular AA** (Tokuyoshi & Kaplanyan) | sparkle on water, metal, wet runways | Done |
+| 6 | **Anti-aliased alpha test** (Golus) | crawling foliage and fences | Done |
 
 ## Why not just TAA, MSAA or DLAA?
 
