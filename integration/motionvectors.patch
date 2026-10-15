@@ -1,0 +1,476 @@
+diff --git a/build.ps1 b/build.ps1
+index 3264c62..cb47b54 100644
+--- a/build.ps1
++++ b/build.ps1
+@@ -290,6 +290,50 @@ for ($i = 0; $i -lt $tuwords.Count; $i += 8) {
+ [IO.File]::WriteAllText("$src/vklayer/taau_spv.h", $tusb.ToString())
+ Write-Host ("  taau_spv.h: {0} words" -f $tuwords.Count)
+ 
++# ---- FSCAA layer 1: Intel CMAA2 (third_party/cmaa2, Apache-2.0), HLSL -> SPIR-V with DXC.
++# u0..u7 -> bindings 0..7, t0 -> binding 10. One edges kernel per quality preset (0..3), plus
++# Intel's DebugDrawEdgesCS for the fscaa.debug_edges overlay.
++Write-Host "Compiling CMAA2 (DXC)..."
++$dxc = Join-Path $vksdk "Bin\dxc.exe"
++if (-not (Test-Path $dxc)) { throw "dxc not found at $dxc" }
++$cmaaSrc = Join-Path $root "third_party\cmaa2\CMAA2.hlsl"
++$cmaaDefs = @('-D','CMAA2_SUPPORT_HDR_COLOR_RANGE=1','-D','CMAA2_EDGE_DETECTION_LUMA_PATH=1',
++              '-D','CMAA2_UAV_STORE_TYPED=1','-D','CMAA2_UAV_STORE_TYPED_UNORM_FLOAT=0',
++              '-D','CMAA2_UAV_STORE_CONVERT_TO_SRGB=0')
++$cmaaFlags = @('-spirv','-T','cs_6_0','-fspv-target-env=vulkan1.2','-fvk-u-shift','0','0',
++               '-fvk-t-shift','10','0','-fvk-s-shift','20','0','-fspv-use-unknown-image-format','-O3')
++$cmaaJobs = @(
++    @{ Name='kCmaa2Edges0';     Entry='EdgesColor2x2CS';         Preset=0 },
++    @{ Name='kCmaa2Edges1';     Entry='EdgesColor2x2CS';         Preset=1 },
++    @{ Name='kCmaa2Edges2';     Entry='EdgesColor2x2CS';         Preset=2 },
++    @{ Name='kCmaa2Edges3';     Entry='EdgesColor2x2CS';         Preset=3 },
++    @{ Name='kCmaa2Args';       Entry='ComputeDispatchArgsCS';   Preset=2 },
++    @{ Name='kCmaa2Cand';       Entry='ProcessCandidatesCS';     Preset=2 },
++    @{ Name='kCmaa2Apply';      Entry='DeferredColorApply2x2CS'; Preset=2 },
++    @{ Name='kCmaa2DebugEdges'; Entry='DebugDrawEdgesCS';        Preset=2 })
++$csb = New-Object System.Text.StringBuilder
++[void]$csb.AppendLine("// Generated from third_party/cmaa2/CMAA2.hlsl by build.ps1 (DXC) - do not edit.")
++[void]$csb.AppendLine("#pragma once")
++[void]$csb.AppendLine("#include <cstdint>")
++[void]$csb.AppendLine("#include <cstddef>")
++foreach ($j in $cmaaJobs) {
++    $tmp = Join-Path $env:TEMP "$($j.Name).spv"
++    & $dxc @cmaaFlags @cmaaDefs '-D' "CMAA2_STATIC_QUALITY_PRESET=$($j.Preset)" '-E' $j.Entry $cmaaSrc '-Fo' $tmp | Out-Host
++    if ($LASTEXITCODE -ne 0) { throw "dxc failed on $($j.Entry) preset $($j.Preset)" }
++    & (Join-Path $vksdk "Bin\spirv-val.exe") --target-env vulkan1.2 $tmp
++    if ($LASTEXITCODE -ne 0) { throw "spirv-val failed on $($j.Name)" }
++    $cbytes = [IO.File]::ReadAllBytes($tmp)
++    $cwords = for ($i = 0; $i -lt $cbytes.Length; $i += 4) { '0x{0:x8}u' -f [BitConverter]::ToUInt32($cbytes, $i) }
++    [void]$csb.AppendLine("static const uint32_t $($j.Name)[] = {")
++    for ($i = 0; $i -lt $cwords.Count; $i += 8) {
++        [void]$csb.AppendLine("    " + (($cwords[$i..([Math]::Min($i + 7, $cwords.Count - 1))]) -join ', ') + ",")
++    }
++    [void]$csb.AppendLine("};")
++    [void]$csb.AppendLine("static const size_t $($j.Name)Words = sizeof($($j.Name)) / sizeof(uint32_t);")
++}
++[IO.File]::WriteAllText("$src/vklayer/cmaa2_spv.h", $csb.ToString())
++Write-Host "  CMAA2: $($cmaaJobs.Count) kernels -> cmaa2_spv.h"
++
+ Write-Host "Compiling nn_conv shader..."
+ $ncTmp = Join-Path $env:TEMP "nn_conv.spv"
+ & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/nn_conv.comp" -o $ncTmp | Out-Null
+diff --git a/src/shaders/taa.comp b/src/shaders/taa.comp
+index 319da58..e9152b3 100644
+--- a/src/shaders/taa.comp
++++ b/src/shaders/taa.comp
+@@ -135,6 +135,10 @@ layout(binding = 6, std140) uniform ReprojData {
+     // z: disocclusion reset (taa.disocc_reset), w: the depth history is really bound at 13/14
+     //    (when it is not, binding 14 aliases the colour history and must never be written)
+     vec4 uReprojParams4;
++    // FSCAA (taa.backend=fscaa, layer 2): x on, y fscaa.near_m. Slots 32-35.
++    vec4 uFscaa;
++    // FSCAA history caps: x fscaa.keep_screen, y fscaa.keep_near, z fscaa.keep_light. Slots 36-39.
++    vec4 uFscaa2;
+ };
+ 
+ // ---- THE ENGINE'S SUN, ASKED DIRECTLY.
+@@ -572,6 +576,7 @@ const int VIZ_WRITTEN   = 8;   // did ANY shader write velocity here - WHITE
+ const int VIZ_SUNVIS    = 9;   // engine-cascade sun visibility per pixel
+ const int VIZ_PROBE     = 10;  // engine cubemap radiance along the view ray
+ const int VIZ_GI        = 11;  // the gathered bounce, relative to the pixel's own luminance
++const int VIZ_FSCAA     = 13;  // FSCAA classes: blue screens, yellow lights, red near, green scenery, grey none
+                                // yes, BLACK no. Ungated by every other
+                                // setting, deliberately: VIZ_MOTION zeroes the
+                                // unwritten sentinel, so "nothing wrote here"
+@@ -2210,6 +2215,25 @@ void main()
+         if (uReprojParams.w >= 1.0) currA = curr;
+     }
+ 
++    // ---- FSCAA CLASS CAPS (taa.backend=fscaa, uFscaa.x). History is the right tool for the
++    // scenery and the wrong one for the own aircraft and the cockpit, where it only smears. Each
++    // class caps how much history it may keep (1 = full TAA, 0 = the CMAA2-cleaned current frame),
++    // applied as a floor on the current weight - the alpha_near/alpha_screen mechanism above.
++    // taa.viz=13 draws the classes: blue screens, yellow lights, red near, green scenery, grey none.
++    if (uFscaa.x > 0.5 || pc.viz == VIZ_FSCAA) {
++        float mwF = texelFetch(uVelocity, ivec3(px, layer), 0).w;
++        bool nearF = velS.z > 0.0 && mvViewDepth(uv + S, float(layer), velS.z) < uFscaa.y;
++        int cls = unwritten ? 0 : abs(mwF - 0.5) < 0.02 ? 1 : mwF >= 1.5 ? 2 : nearF ? 3 : 4;
++        if (pc.viz == VIZ_FSCAA) {
++            vec3 cc = cls == 1 ? vec3(0.1, 0.3, 1.0) : cls == 2 ? vec3(1.0, 0.9, 0.1) :
++                      cls == 3 ? vec3(1.0, 0.15, 0.1) : cls == 4 ? vec3(0.0, 0.6, 0.0) : vec3(0.2);
++            imageStore(uHistory, ivec3(px, layer), vec4(cc, 1.0));
++            return;
++        }
++        float keep = cls == 1 ? uFscaa2.x : cls == 2 ? uFscaa2.z : cls == 3 ? uFscaa2.y : 1.0;
++        a = max(a, 1.0 - clamp(keep, 0.0, 1.0));
++    }
++
+     // ---- DISOCCLUSION (taa.disocc_reset, uReprojParams4.z). Ground just uncovered by a
+     // moving tail or wing reprojects onto history that belongs to the airframe: white
+     // fuselage over light concrete sits inside the colour box, so the clamp keeps it and
+diff --git a/src/vklayer/layer.cpp b/src/vklayer/layer.cpp
+index 2d5613e..d0786ed 100644
+--- a/src/vklayer/layer.cpp
++++ b/src/vklayer/layer.cpp
+@@ -2250,6 +2250,7 @@ static std::vector<uint64_t> g_famUnmatched;
+ static size_t g_famZero = 0, g_famMasked = 0, g_famGround = 0, g_famNone = 0;
+ #include "mv_target.h"
+ #include "spirv_inject.h"
++#include "fscaa.h"          // FSCAA: settings, shader-rewrite dispatch, stats (taa.backend=fscaa)
+ #include "xpfsr_spv.h"
+ #include "fsr_probe.h"
+ #include "depth_copy.h"
+@@ -4243,7 +4244,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
+         }
+     }
+ 
+-    VkResult r = next(device, (drop || addedDst || addedMutable) ? &ci2 : ci, alloc, out);
++    // ---- FSCAA in-place CMAA2 (perf): X-Plane's HDR scene targets become storage-capable, so
++    // CMAA2 runs on them directly instead of on a full-frame copy (fscaa.h, wantsStorage).
++    bool addedStorage = false;
++    if (fscaa::wantsStorage(ci)) {
++        if (!(drop || addedDst || addedMutable)) ci2 = *ci;
++        ci2.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++        addedStorage = true;
++    }
++
++    VkResult r = next(device, (drop || addedDst || addedMutable || addedStorage) ? &ci2 : ci, alloc, out);
++    if (addedStorage && r == VK_SUCCESS && out && *out) {
++        std::lock_guard<std::mutex> g(fscaa::storageMtx());
++        fscaa::storageImages().insert(*out);
++        static std::atomic<int> nStorage(0);
++        if (++nStorage <= 16)
++            trace("FSCAA: scene target %p %ux%u made storage-capable for in-place CMAA2 (%d so far)",
++                  (void *)*out, ci->extent.width, ci->extent.height, nStorage.load());
++    }
+     if (r == VK_SUCCESS && ci && out && *out != VK_NULL_HANDLE) {
+         // Creation record for the oracle: what this handle IS. ci, not ci2 -
+         // the caller's intent, though usage may have been augmented above.
+@@ -4787,6 +4805,14 @@ static std::set<VkImage> g_seenAsAttachment;
+ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
+     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
+ {
++    if (img != VK_NULL_HANDLE) {   // FSCAA: forget a scene target before its handle can be recycled
++        bool was = false;
++        {
++            std::lock_guard<std::mutex> g(fscaa::storageMtx());
++            was = fscaa::storageImages().erase(img) != 0;
++        }
++        if (was) fscaaForgetImage(img);
++    }
+     // ---- A NULL HANDLE IS NOT A DESTRUCTION. GUARD BEFORE ANY BOOKKEEPING.
+     //
+     // vkDestroyImage(device, VK_NULL_HANDLE, ...) is explicitly legal and does
+@@ -12163,6 +12189,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
+     }
+     taau::shutdown();
+     gi::shutdown();
++    fscaaShutdown();
+ 
+     // ---- THE FRAME-GENERATION PROXY DIES WITH ITS DEVICE.
+     //
+@@ -12876,6 +12903,31 @@ static uint64_t g_gfxPipelines  = 0;
+ static uint64_t g_inlineModules = 0;   // maintenance5 path - no module object
+ static PFN_vkCreateShaderModule     g_nextCreateShaderModule = nullptr;
+ static PFN_vkCreateGraphicsPipelines g_nextCreateGfxPipelines = nullptr;
++static PFN_vkDestroyShaderModule    g_nextDestroyShaderModule = nullptr;
++
++// ---- FSCAA SHADER REWRITES (fscaa.h). A module X-Plane creates may be handed to the driver
++// rewritten (wire / light / specular / alpha AA, or the debug tint). The motion-vector injector
++// identifies modules by the hash of their ORIGINAL code (mv_family_table.h), so that hash is kept
++// per module and used instead of hashing the stored, rewritten code. Under g_lock.
++static std::map<VkShaderModule, uint64_t> g_moduleOrigHash;
++static std::map<VkShaderModule, uint32_t> g_fscaaModuleBits;   // module -> fscaa layer bit it carries
++
++static uint64_t mvModuleHash(VkShaderModule m, const std::vector<uint32_t> &code)
++{
++    std::map<VkShaderModule, uint64_t>::iterator it = g_moduleOrigHash.find(m);
++    return it != g_moduleOrigHash.end() ? it->second : mvFragHash(code);
++}
++
++static VKAPI_ATTR void VKAPI_CALL TAA_DestroyShaderModule(VkDevice device, VkShaderModule m,
++                                                          const VkAllocationCallbacks *alloc)
++{
++    if (m) {   // handles are recycled; a stale entry would mislabel the next module
++        std::lock_guard<std::mutex> g(g_lock);
++        g_moduleOrigHash.erase(m);
++        g_fscaaModuleBits.erase(m);
++    }
++    if (g_nextDestroyShaderModule) g_nextDestroyShaderModule(device, m, alloc);
++}
+ 
+ // Defined with the rest of the injection plumbing below. Declared here because
+ // the refusals they count happen at module creation, which comes first in the
+@@ -12958,6 +13010,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+               "small to be EASU or RCAS - left alone, it is used elsewhere in "
+               "the frame", ci->codeSize);
+ 
++    // ---- FSCAA: rewrite listed X-Plane modules (exact hash) - fscaa.h / fscaa_patch.h.
++    std::vector<uint32_t> fscaaCode;
++    VkShaderModuleCreateInfo fscaaCi;
++    uint32_t fscaaBit = 0;
++    uint64_t fscaaOrigHash = 0;
++    if (ci && ci->pCode && ciUse == ci) {
++        fscaaOrigHash = fscaapatch::hashWords(ci->pCode, ci->codeSize / 4);
++        fscaaBit = fscaa::patchModule(ci->pCode, ci->codeSize / 4, fscaaOrigHash, fscaaCode);
++        if (fscaaBit) {
++            fscaaCi = *ci;
++            fscaaCi.pCode = fscaaCode.data();
++            fscaaCi.codeSize = fscaaCode.size() * 4;
++            ciUse = &fscaaCi;
++        }
++    }
++
+     if (ci) {
+         ++g_shaderModules;
+         g_shaderBytes += ci->codeSize;
+@@ -13108,6 +13176,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+             : VK_ERROR_INITIALIZATION_FAILED;
+         if (rr == VK_SUCCESS && out) {
+             std::lock_guard<std::mutex> g(g_lock);
++            // FSCAA-rewritten modules keep their rewritten code (so the injector builds on it)
++            // and their original hash (so the family table still recognises them).
++            if (fscaaBit) {
++                g_moduleCode[*out] = fscaaCode;
++                g_moduleOrigHash[*out] = fscaaOrigHash;
++                g_fscaaModuleBits[*out] = fscaaBit;
++            } else
+             g_moduleCode[*out].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+             mvDumpModule(ci->pCode, ci->codeSize);
+             if (isXpFsr) g_xpFsrModules.insert(*out);
+@@ -13164,6 +13239,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+         VkResult rr = g_nextCreateShaderModule
+             ? g_nextCreateShaderModule(device, ciUse, alloc, out)
+             : VK_ERROR_INITIALIZATION_FAILED;
++        if (rr == VK_SUCCESS && out && fscaaBit) {
++            std::lock_guard<std::mutex> g(g_lock);
++            g_moduleOrigHash[*out] = fscaaOrigHash;
++            g_fscaaModuleBits[*out] = fscaaBit;
++        }
++        if (rr == VK_SUCCESS && out && fscaaBit) {
++            std::lock_guard<std::mutex> g(g_lock);
++            g_moduleOrigHash[*out] = fscaaOrigHash;
++            g_fscaaModuleBits[*out] = fscaaBit;
++        }
+         if (rr == VK_SUCCESS && out && isXpFsr) {
+             std::lock_guard<std::mutex> g(g_lock);
+             g_xpFsrModules.insert(*out);
+@@ -13964,6 +14049,59 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+     const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc,
+     VkPipeline *out)
+ {
++    // ---- FSCAA WIRE AA NEEDS BLENDING. The rewritten line3d vertex shader carries the coverage a
++    // sub-pixel wire lost into its alpha (fscaa_patch.h::wire); that only shows if attachment 0
++    // blends. Pipelines built from a wire-rewritten module get standard alpha blending if they had
++    // none. The arrays live to the end of this call.
++    std::vector<VkGraphicsPipelineCreateInfo> fscaaCi;
++    std::vector<VkPipelineColorBlendStateCreateInfo> fscaaBlend;
++    std::vector<std::vector<VkPipelineColorBlendAttachmentState> > fscaaAtt;
++    if (ci && count) {
++        std::vector<char> wire(count, 0);
++        bool any = false;
++        {
++            std::lock_guard<std::mutex> g(g_lock);
++            if (!g_fscaaModuleBits.empty())
++                for (uint32_t i = 0; i < count; ++i)
++                    for (uint32_t st = 0; st < ci[i].stageCount; ++st) {
++                        std::map<VkShaderModule, uint32_t>::iterator mb = g_fscaaModuleBits.find(ci[i].pStages[st].module);
++                        if (mb != g_fscaaModuleBits.end() && (mb->second & fscaa::kWire)) { wire[i] = 1; any = true; }
++                    }
++        }
++        if (any) {
++            fscaaCi.assign(ci, ci + count);
++            fscaaBlend.resize(count);
++            fscaaAtt.resize(count);
++            bool changed = false;
++            for (uint32_t i = 0; i < count; ++i) {
++                const VkPipelineColorBlendStateCreateInfo *bs = ci[i].pColorBlendState;
++                if (!wire[i]) continue;
++                if (!bs || !bs->attachmentCount || !bs->pAttachments) {
++                    static std::atomic<int> nNo(0);
++                    if (++nNo <= 2) trace("FSCAA: wire pipeline has no colour blend state - coverage cannot show");
++                    continue;
++                }
++                static std::atomic<int> nSeen(0);
++                if (++nSeen <= 4)
++                    trace("FSCAA: wire pipeline attachment 0 blendEnable %d (src %d dst %d)%s", (int)bs->pAttachments[0].blendEnable,
++                          (int)bs->pAttachments[0].srcColorBlendFactor, (int)bs->pAttachments[0].dstColorBlendFactor,
++                          bs->pAttachments[0].blendEnable ? "" : " - ENABLING alpha blending for wire coverage");
++                if (bs->pAttachments[0].blendEnable) continue;
++                fscaaAtt[i].assign(bs->pAttachments, bs->pAttachments + bs->attachmentCount);
++                VkPipelineColorBlendAttachmentState &a0 = fscaaAtt[i][0];
++                a0.blendEnable = VK_TRUE;
++                a0.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; a0.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++                a0.colorBlendOp = VK_BLEND_OP_ADD;
++                a0.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; a0.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++                a0.alphaBlendOp = VK_BLEND_OP_ADD;
++                fscaaBlend[i] = *bs;
++                fscaaBlend[i].pAttachments = fscaaAtt[i].data();
++                fscaaCi[i].pColorBlendState = &fscaaBlend[i];
++                changed = true;
++            }
++            if (changed) ci = fscaaCi.data();
++        }
++    }
+     if (ci) {
+         for (uint32_t i = 0; i < count; ++i) {
+             ++g_gfxPipelines;
+@@ -14456,7 +14594,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+                 std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
+                     g_moduleCode.find(ci[i].pStages[s].module);
+                 if (mc != g_moduleCode.end()) {
+-                    vertHash      = mvFragHash(mc->second);
++                    vertHash      = mvModuleHash(ci[i].pStages[s].module, mc->second);
+                     vertInstanced = mvCodeHasName(mc->second, "instance_data");
+                 }
+             }
+@@ -14609,7 +14747,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+                         std::lock_guard<std::mutex> g(g_lock);
+                         std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
+                             g_moduleCode.find(ci[i].pStages[s].module);
+-                        if (mc != g_moduleCode.end()) fragHash = mvFragHash(mc->second);
++                        if (mc != g_moduleCode.end()) fragHash = mvModuleHash(ci[i].pStages[s].module, mc->second);
+                     }
+                     maskVelocity = mvFragMasked(fragHash);
+                     // ---- OPTION-2 COARSE MASK (TAA_MASK_SEETHROUGH).
+@@ -18682,6 +18820,8 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
+                                    nextGDPA(*out, "vkCreateShaderModule");
+     g_nextCreateGfxPipelines = (PFN_vkCreateGraphicsPipelines)
+                                    nextGDPA(*out, "vkCreateGraphicsPipelines");
++    g_nextDestroyShaderModule = (PFN_vkDestroyShaderModule)
++                                    nextGDPA(*out, "vkDestroyShaderModule");
+     GD(createFence, CreateFence);                 GD(resetFences, ResetFences);  GD(waitForFences, WaitForFences);
+     GD(queueSubmit, QueueSubmit);                 GD(getDeviceQueue, GetDeviceQueue);
+     GD(destroyPipeline, DestroyPipeline);         GD(destroyPipelineLayout, DestroyPipelineLayout);
+@@ -20414,6 +20554,7 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
+     RETURN_IF("vkCmdCopyImage",        TAA_CmdCopyImage)
+     RETURN_IF("vkCmdClearColorImage",  TAA_CmdClearColorImage)
+     RETURN_IF("vkCreateShaderModule",   TAA_CreateShaderModule)
++    RETURN_IF("vkDestroyShaderModule",  TAA_DestroyShaderModule)
+     RETURN_IF("vkCreateComputePipelines", TAA_CreateComputePipelines)
+     RETURN_IF("vkCmdDispatch",          TAA_CmdDispatch)
+     RETURN_IF("vkCmdPushDescriptorSetKHR", TAA_CmdPushDescriptorSetKHR)
+diff --git a/src/vklayer/taa.h b/src/vklayer/taa.h
+index 642f247..489ecc8 100644
+--- a/src/vklayer/taa.h
++++ b/src/vklayer/taa.h
+@@ -41,6 +41,7 @@
+ #include <map>
+ #include "taa_spv.h"
+ #include "temporal.h"
++#include "cmaa2.h"      // FSCAA layer 1 (taa.backend=fscaa)
+ 
+ struct TaaState {
+     VkDevice        device      = VK_NULL_HANDLE;
+@@ -1666,6 +1667,80 @@ static void taaRecordMetrics(DeviceData &dd, VkCommandBuffer cb)
+     metrics::record(dd, g_taa.device, mi);
+ }
+ 
++// ---- FSCAA LAYER 1: CMAA2 BEFORE THE RESOLVE (taa.backend=fscaa, fscaa.h).
++// In place on X-Plane's scene when Layer_CreateImage made it storage-capable (no copy, no extra
++// image); otherwise on a copy that the resolve then samples as uScene. Either way the history
++// accumulates edge-cleaned frames. Layer 2 (class caps) is in taa.comp, driven by slots 32-39.
++static cmaa2::Fns   g_cmaaFns;
++static cmaa2::State g_cmaa;
++static std::mutex   g_cmaaMtx;          // the in-place view cache is also touched by Layer_DestroyImage
++static bool         g_cmaaFnsOk = false, g_cmaaFailed = false;
++static VkImageView  g_fscaaSceneView = VK_NULL_HANDLE;   // copy mode: the cleaned copy, for uScene
++static uint64_t     g_fscaaFrame = 0;
++static uint32_t     g_fscaaCtr[16] = {};
++
++static void fscaaRecordCmaa(DeviceData &dd, VkCommandBuffer cb)
++{
++    g_fscaaSceneView = VK_NULL_HANDLE;
++    const fscaa::Settings s = fscaa::read();
++    if (!s.on) return;
++    ++g_fscaaFrame;
++    const bool statsFrame = s.statsEvery > 0 && (g_fscaaFrame % (uint64_t)s.statsEvery) == 0;
++    bool ran = false;
++    if (!(s.layers & fscaa::kCmaa)) fscaa::skipOnce("fscaa.layers excludes CMAA2 (bit 1)");
++    else if (g_taa.layers != 1)    fscaa::skipOnce("multi-layer (VR) scene - FSCAA is single-view only");
++    else if (!g_cmaaFailed) {
++        std::lock_guard<std::mutex> g(g_cmaaMtx);
++        if (!g_cmaaFnsOk) {
++            VkPhysicalDeviceMemoryProperties mp; memset(&mp, 0, sizeof(mp));
++            if (g_getPhysMemProps && dd.phys) g_getPhysMemProps(dd.phys, &mp);
++            g_cmaaFnsOk = dd.gdpa && cmaa2::loadFns(g_cmaaFns, dd.gdpa, g_taa.device, mp);
++            if (!g_cmaaFnsOk) { g_cmaaFailed = true; fscaa::skipOnce("CMAA2 entry points missing"); }
++        }
++        const bool inplace = fscaa::sceneHasStorage(g_taa.sceneImage);
++        if (g_cmaaFnsOk && (g_cmaa.w != g_taa.w || g_cmaa.h != g_taa.h || !g_cmaa.pl || g_cmaa.ownColor == inplace)) {
++            if (g_cmaa.dev && dd.deviceWaitIdle) dd.deviceWaitIdle(g_taa.device);   // resize: nothing in flight may use the old set
++            if (!cmaa2::create(g_cmaaFns, g_cmaa, g_taa.device, g_taa.w, g_taa.h, !inplace)) {
++                g_cmaaFailed = true;
++                trace("FSCAA: CMAA2 resources for %ux%u FAILED - running the class caps without it", g_taa.w, g_taa.h);
++            } else {
++                trace("FSCAA: CMAA2 ready at %ux%u, %s, %.1f MB", g_taa.w, g_taa.h,
++                      inplace ? "IN PLACE on X-Plane's scene target (no copy)" : "copy mode (scene not storage-capable)",
++                      cmaa2::bytes(g_cmaa) / 1048576.0);
++            }
++        }
++        if (g_cmaaFnsOk && !g_cmaaFailed) {
++            if (statsFrame) cmaa2::readCounters(g_cmaa, g_fscaaCtr);   // the copy recorded on the previous stats frame
++            gpuTimeMark(dd, cb, "cmaa2");
++            if (inplace) {
++                ran = cmaa2::recordInPlace(g_cmaaFns, g_cmaa, cb, g_taa.sceneImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                           s.cmaaPreset, s.debugEdges);
++                if (!ran) fscaa::skipOnce("in-place record refused (more distinct scene targets than cached)");
++            } else {
++                ran = cmaa2::record(g_cmaaFns, g_cmaa, cb, g_taa.sceneImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                    s.cmaaPreset, s.debugEdges);
++                if (ran) g_fscaaSceneView = g_cmaa.colorArrayView;
++                else fscaa::skipOnce("copy-mode record refused");
++            }
++            if (ran && statsFrame) cmaa2::recordCounterCopy(g_cmaaFns, g_cmaa, cb);
++        }
++    }
++    if (statsFrame) fscaa::frameStats(s, g_fscaaFrame, ran, g_fscaaCtr, cmaa2::bytes(g_cmaa), g_taa.w, g_taa.h);
++}
++
++static void fscaaForgetImage(VkImage img)
++{
++    std::lock_guard<std::mutex> g(g_cmaaMtx);
++    if (g_cmaaFnsOk && g_cmaa.dev) cmaa2::forget(g_cmaaFns, g_cmaa, img);
++}
++
++static void fscaaShutdown()
++{
++    std::lock_guard<std::mutex> g(g_cmaaMtx);
++    if (g_cmaaFnsOk && g_cmaa.dev) cmaa2::destroy(g_cmaaFns, g_cmaa);
++    g_cmaaFnsOk = false; g_cmaaFailed = false; g_fscaaSceneView = VK_NULL_HANDLE;
++}
++
+ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+                              float jitterX, float jitterY, bool reset,
+                              bool cameraMoved)
+@@ -1838,6 +1913,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+                               0, nullptr, 0, nullptr, nHist, hist);
+     }
+ 
++    // FSCAA layer 1: the scene is now in SHADER_READ_ONLY_OPTIMAL (bar[0] above), which is the
++    // layout cmaa2 expects and restores. Off unless taa.backend=fscaa.
++    if (!dlaaRun) fscaaRecordCmaa(dd, cb);
++
+     // ---- THE GATHER, AFTER THE TRANSITIONS AND BEFORE THE RESOLVE.
+     //
+     // It must come after the barriers above, not before them: bar[0] moves the
+@@ -2070,11 +2149,24 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+         const bool hdBound = g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE;
+         slot[30] = (hdBound && !dlaaRun && live::onoff("taa.disocc_reset", "TAA_DISOCC_RESET", true)) ? 1.0f : 0.0f;
+         slot[31] = hdBound ? 1.0f : 0.0f;
++        // uFscaa / uFscaa2 (taa.comp): FSCAA layer 2, per-class history caps. Off unless
++        // taa.backend=fscaa with bit 2 of fscaa.layers.
++        {
++            const fscaa::Settings fs = fscaa::read();
++            const bool caps = fs.on && (fs.layers & fscaa::kCaps) && g_taa.layers == 1 && !dlaaRun;
++            slot[32] = caps ? 1.0f : 0.0f;
++            slot[33] = fs.nearM;
++            slot[34] = 0.0f; slot[35] = 0.0f;
++            slot[36] = fs.keepScreen;
++            slot[37] = fs.keepNear;
++            slot[38] = fs.keepLight;
++            slot[39] = 0.0f;
++        }
+     }
+ 
+     VkDescriptorImageInfo ii[8];
+     memset(ii, 0, sizeof(ii));
+-    ii[0].imageView = g_taa.sceneView;
++    ii[0].imageView = g_fscaaSceneView ? g_fscaaSceneView : g_taa.sceneView;   // FSCAA copy mode: the cleaned copy
+     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+     ii[0].sampler   = g_taa.sampler;
+     ii[1].imageView = g_taa.historyView[hw_]; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;

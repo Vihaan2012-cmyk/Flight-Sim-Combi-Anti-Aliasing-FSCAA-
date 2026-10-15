@@ -74,7 +74,18 @@ plan's Tasks 1–4, executed exactly as written there; executors read both docum
 | `tools/fscaa_patch_test.cpp` (create) | runs every transform over all variants, writes outputs for `spirv-val` |
 | `tools/fscaa_validate.sh` (create) | one command: patch all + `spirv-val` all + summary |
 
-## Phases and the one-shot order
+## Execution: three stages (user, 2026-10-15)
+
+1. **Build all.** The code of Tasks 1–12 is written and must compile. Within each task, only the
+   build-only checks run in this stage.
+2. **Static debug all.** Every offline proof runs and every failure is fixed:
+   - DXC reflection
+   - the `cmaa2_test` GPU test under Khronos validation
+   - `fscaa_validate.sh` across all 6,775 variants with `spirv-val`
+   - the patch coverage counts
+3. **Live debug with the user flying X-Plane.** This is Task 13.
+
+## Task order
 
 1. Tasks 1–4: Phase 1 (CMAA2 + class caps). Proven offline: build, GPU test under validation.
 2. Task 5: the debugging toolkit. It's built before the shader layers because they're debugged with it.
