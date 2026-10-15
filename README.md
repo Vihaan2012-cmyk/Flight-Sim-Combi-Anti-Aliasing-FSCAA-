@@ -49,7 +49,7 @@ Settings live in `%TEMP%\taa_live.ini`.
 | `fscaa.layers` | 63 | bitmask: 1 CMAA2, 2 class caps, 4 wire, 8 light, 16 specular, 32 alpha (bits 4–32 latch at load) |
 | `fscaa.cmaa_preset` | 2 | CMAA2 edge threshold: 0 LOW … 3 ULTRA |
 | `fscaa.near_m` | 80 | distance treated as "your aircraft / cockpit" |
-| `fscaa.keep_near` | 0.5 | how much history near geometry may keep |
+| `fscaa.keep_near` | 1.0 | how much history near geometry may keep (below 1, near edges show the jitter) |
 | `fscaa.keep_screen` | 0.0 | history on cockpit screens (0 = none, no ghosting) |
 | `fscaa.keep_light` | 1.0 | history on lights |
 
@@ -61,7 +61,6 @@ Settings live in `%TEMP%\taa_live.ini`.
 | `fscaa.light_min_px` | 1.5 | smallest a light sprite may draw; brightness is energy-conserved |
 | `fscaa.spec_sigma` / `fscaa.spec_kappa` | 0.25 / 0.18 | specular AA filter width / clamp |
 | `fscaa.alpha_edge` | 1.0 | width of the dithered alpha-test edge, in `fwidth` units |
-| `fscaa.inplace` | 1 | run CMAA2 directly on X-Plane's scene image (no full-frame copy) |
 
 **Debugging:**
 
@@ -94,8 +93,9 @@ The trace also logs `FSCAA PATCH:` lines with how many shaders each layer rewrot
 ## Target
 
 X-Plane 12.4.x on Vulkan, Windows. Developed and measured on an RTX 4060 (8 GB) at 2560x1440. The
-budget is about 1 ms on top of TAA. In-place CMAA2 needs about 16 MB of working buffers at 1440p and no
-extra frame copy.
+budget is about 1 ms on top of TAA. CMAA2 runs after the resolve, in place on the layer's own sharpen
+target: 25 MB at 1440p and no extra frame copy. Measured in flight at 2560x1440 (2026-10-15): resolve
+1.46 ms, sharpen 0.21 ms, CMAA2 0.19 ms, copy 0.09 ms - 1.94 ms in all.
 
 ## Licence
 

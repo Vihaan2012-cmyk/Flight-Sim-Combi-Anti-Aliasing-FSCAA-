@@ -30,7 +30,7 @@ struct Settings {
     bool on = false;             // taa.backend == fscaa
     uint32_t layers = kAll;      // fscaa.layers bitmask
     int cmaaPreset = 2;          // fscaa.cmaa_preset 0..3
-    float nearM = 80.0f, keepNear = 0.5f, keepScreen = 0.0f, keepLight = 1.0f;
+    float nearM = 80.0f, keepNear = 1.0f, keepScreen = 0.0f, keepLight = 1.0f;
     bool debugEdges = false;     // fscaa.debug_edges: CMAA2's edge overlay, live
     int statsEvery = 600;        // fscaa.stats_every, frames (0 = off)
 };
@@ -46,7 +46,7 @@ inline Settings read()
     if (s.cmaaPreset < 0) s.cmaaPreset = 0;
     if (s.cmaaPreset > 3) s.cmaaPreset = 3;
     s.nearM = live::f("fscaa.near_m", nullptr, 80.0f);
-    s.keepNear = live::f("fscaa.keep_near", nullptr, 0.5f);
+    s.keepNear = live::f("fscaa.keep_near", nullptr, 1.0f);
     s.keepScreen = live::f("fscaa.keep_screen", nullptr, 0.0f);
     s.keepLight = live::f("fscaa.keep_light", nullptr, 1.0f);
     s.debugEdges = live::onoff("fscaa.debug_edges", nullptr, false);
@@ -58,7 +58,6 @@ inline Settings read()
 // while the scenery loads, before any present - see msaaPerPixelOn's history, 2026-10-12).
 struct Latched {
     bool on = false;
-    bool inplace = true;         // fscaa.inplace: CMAA2 on X-Plane's own scene image (STORAGE added at creation)
     uint32_t layers = kAll;
     float wireMinPx = 1.0f, lightMinPx = 1.5f, specSigma = 0.25f, specKappa = 0.18f, alphaEdge = 1.0f;
     std::string tint;            // fscaa.debug_tint=<family>: draw that family magenta
@@ -73,7 +72,6 @@ inline const Latched &latched()
         Settings s = read();
         L.on = s.on;
         L.layers = s.layers;
-        L.inplace = live::onoff("fscaa.inplace", nullptr, true);
         L.wireMinPx = live::f("fscaa.wire_min_px", nullptr, 1.0f);
         L.lightMinPx = live::f("fscaa.light_min_px", nullptr, 1.5f);
         L.specSigma = live::f("fscaa.spec_sigma", nullptr, 0.25f);
@@ -81,10 +79,10 @@ inline const Latched &latched()
         L.alphaEdge = live::f("fscaa.alpha_edge", nullptr, 1.0f);
         live::lookup("fscaa.debug_tint", L.tint);
         trace("FSCAA: shader rewrites %s - layers 0x%02x (wire %d, light %d, specular %d, alpha %d), wire_min_px %.2f, "
-              "light_min_px %.2f, spec sigma %.2f kappa %.2f, alpha_edge %.2f, CMAA2 %s%s%s",
+              "light_min_px %.2f, spec sigma %.2f kappa %.2f, alpha_edge %.2f, CMAA2 after the resolve%s%s",
               L.on ? "ARMED" : "off (taa.backend is not fscaa)", L.layers, !!(L.layers & kWire), !!(L.layers & kLight),
               !!(L.layers & kSpecular), !!(L.layers & kAlpha), L.wireMinPx, L.lightMinPx, L.specSigma, L.specKappa,
-              L.alphaEdge, L.inplace ? "in place" : "copy mode", L.tint.empty() ? "" : ", debug tint on family ", L.tint.c_str());
+              L.alphaEdge, L.tint.empty() ? "" : ", debug tint on family ", L.tint.c_str());
     });
     return L;
 }
@@ -169,29 +167,6 @@ inline uint32_t patchModule(const uint32_t *code, size_t words, uint64_t hash, s
     }
     if (k % 2000 == 0) reportPatches();
     return bit;
-}
-
-// ------------------------------------------------------------------ in-place CMAA2 (perf)
-// X-Plane's HDR scene targets get VK_IMAGE_USAGE_STORAGE_BIT at creation (Layer_CreateImage) so
-// CMAA2 can run on them directly: no full-frame copy (2 x 29.5 MB of traffic at 1440p) and no
-// 29.5 MB working colour. The images it was added to are remembered here.
-inline std::mutex &storageMtx() { static std::mutex m; return m; }
-inline std::set<VkImage> &storageImages() { static std::set<VkImage> s; return s; }
-inline bool sceneHasStorage(VkImage img)
-{
-    std::lock_guard<std::mutex> g(storageMtx());
-    return storageImages().count(img) != 0;
-}
-
-// Does this create-info describe an HDR scene target worth making storage-capable?
-inline bool wantsStorage(const VkImageCreateInfo *ci)
-{
-    const Latched &L = latched();
-    if (!L.on || !L.inplace || !(L.layers & kCmaa) || !ci) return false;
-    return ci->imageType == VK_IMAGE_TYPE_2D && ci->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
-           ci->samples == VK_SAMPLE_COUNT_1_BIT && ci->arrayLayers == 1 && ci->mipLevels == 1 &&
-           (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
-           !(ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) && ci->extent.width >= 1280 && ci->extent.height >= 720;
 }
 
 // ------------------------------------------------------------------ per-frame stats

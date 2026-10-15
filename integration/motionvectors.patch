@@ -103,7 +103,7 @@ index 319da58..e9152b3 100644
      // moving tail or wing reprojects onto history that belongs to the airframe: white
      // fuselage over light concrete sits inside the colour box, so the clamp keeps it and
 diff --git a/src/vklayer/layer.cpp b/src/vklayer/layer.cpp
-index 2d5613e..d0786ed 100644
+index 2d5613e..a7c8ebe 100644
 --- a/src/vklayer/layer.cpp
 +++ b/src/vklayer/layer.cpp
 @@ -2250,6 +2250,7 @@ static std::vector<uint64_t> g_famUnmatched;
@@ -114,48 +114,7 @@ index 2d5613e..d0786ed 100644
  #include "xpfsr_spv.h"
  #include "fsr_probe.h"
  #include "depth_copy.h"
-@@ -4243,7 +4244,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
-         }
-     }
- 
--    VkResult r = next(device, (drop || addedDst || addedMutable) ? &ci2 : ci, alloc, out);
-+    // ---- FSCAA in-place CMAA2 (perf): X-Plane's HDR scene targets become storage-capable, so
-+    // CMAA2 runs on them directly instead of on a full-frame copy (fscaa.h, wantsStorage).
-+    bool addedStorage = false;
-+    if (fscaa::wantsStorage(ci)) {
-+        if (!(drop || addedDst || addedMutable)) ci2 = *ci;
-+        ci2.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-+        addedStorage = true;
-+    }
-+
-+    VkResult r = next(device, (drop || addedDst || addedMutable || addedStorage) ? &ci2 : ci, alloc, out);
-+    if (addedStorage && r == VK_SUCCESS && out && *out) {
-+        std::lock_guard<std::mutex> g(fscaa::storageMtx());
-+        fscaa::storageImages().insert(*out);
-+        static std::atomic<int> nStorage(0);
-+        if (++nStorage <= 16)
-+            trace("FSCAA: scene target %p %ux%u made storage-capable for in-place CMAA2 (%d so far)",
-+                  (void *)*out, ci->extent.width, ci->extent.height, nStorage.load());
-+    }
-     if (r == VK_SUCCESS && ci && out && *out != VK_NULL_HANDLE) {
-         // Creation record for the oracle: what this handle IS. ci, not ci2 -
-         // the caller's intent, though usage may have been augmented above.
-@@ -4787,6 +4805,14 @@ static std::set<VkImage> g_seenAsAttachment;
- static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
-     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
- {
-+    if (img != VK_NULL_HANDLE) {   // FSCAA: forget a scene target before its handle can be recycled
-+        bool was = false;
-+        {
-+            std::lock_guard<std::mutex> g(fscaa::storageMtx());
-+            was = fscaa::storageImages().erase(img) != 0;
-+        }
-+        if (was) fscaaForgetImage(img);
-+    }
-     // ---- A NULL HANDLE IS NOT A DESTRUCTION. GUARD BEFORE ANY BOOKKEEPING.
-     //
-     // vkDestroyImage(device, VK_NULL_HANDLE, ...) is explicitly legal and does
-@@ -12163,6 +12189,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
+@@ -12163,6 +12164,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
      }
      taau::shutdown();
      gi::shutdown();
@@ -163,7 +122,7 @@ index 2d5613e..d0786ed 100644
  
      // ---- THE FRAME-GENERATION PROXY DIES WITH ITS DEVICE.
      //
-@@ -12876,6 +12903,31 @@ static uint64_t g_gfxPipelines  = 0;
+@@ -12876,6 +12878,31 @@ static uint64_t g_gfxPipelines  = 0;
  static uint64_t g_inlineModules = 0;   // maintenance5 path - no module object
  static PFN_vkCreateShaderModule     g_nextCreateShaderModule = nullptr;
  static PFN_vkCreateGraphicsPipelines g_nextCreateGfxPipelines = nullptr;
@@ -195,7 +154,7 @@ index 2d5613e..d0786ed 100644
  
  // Defined with the rest of the injection plumbing below. Declared here because
  // the refusals they count happen at module creation, which comes first in the
-@@ -12958,6 +13010,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+@@ -12958,6 +12985,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
                "small to be EASU or RCAS - left alone, it is used elsewhere in "
                "the frame", ci->codeSize);
  
@@ -218,7 +177,7 @@ index 2d5613e..d0786ed 100644
      if (ci) {
          ++g_shaderModules;
          g_shaderBytes += ci->codeSize;
-@@ -13108,6 +13176,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+@@ -13108,6 +13151,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
              : VK_ERROR_INITIALIZATION_FAILED;
          if (rr == VK_SUCCESS && out) {
              std::lock_guard<std::mutex> g(g_lock);
@@ -232,7 +191,7 @@ index 2d5613e..d0786ed 100644
              g_moduleCode[*out].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
              mvDumpModule(ci->pCode, ci->codeSize);
              if (isXpFsr) g_xpFsrModules.insert(*out);
-@@ -13164,6 +13239,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+@@ -13164,6 +13214,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
          VkResult rr = g_nextCreateShaderModule
              ? g_nextCreateShaderModule(device, ciUse, alloc, out)
              : VK_ERROR_INITIALIZATION_FAILED;
@@ -249,7 +208,7 @@ index 2d5613e..d0786ed 100644
          if (rr == VK_SUCCESS && out && isXpFsr) {
              std::lock_guard<std::mutex> g(g_lock);
              g_xpFsrModules.insert(*out);
-@@ -13964,6 +14049,59 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+@@ -13964,6 +14024,59 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
      const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc,
      VkPipeline *out)
  {
@@ -309,7 +268,7 @@ index 2d5613e..d0786ed 100644
      if (ci) {
          for (uint32_t i = 0; i < count; ++i) {
              ++g_gfxPipelines;
-@@ -14456,7 +14594,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+@@ -14456,7 +14569,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                  std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
                      g_moduleCode.find(ci[i].pStages[s].module);
                  if (mc != g_moduleCode.end()) {
@@ -318,7 +277,7 @@ index 2d5613e..d0786ed 100644
                      vertInstanced = mvCodeHasName(mc->second, "instance_data");
                  }
              }
-@@ -14609,7 +14747,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+@@ -14609,7 +14722,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                          std::lock_guard<std::mutex> g(g_lock);
                          std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
                              g_moduleCode.find(ci[i].pStages[s].module);
@@ -327,7 +286,7 @@ index 2d5613e..d0786ed 100644
                      }
                      maskVelocity = mvFragMasked(fragHash);
                      // ---- OPTION-2 COARSE MASK (TAA_MASK_SEETHROUGH).
-@@ -18682,6 +18820,8 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
+@@ -18682,6 +18795,8 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
                                     nextGDPA(*out, "vkCreateShaderModule");
      g_nextCreateGfxPipelines = (PFN_vkCreateGraphicsPipelines)
                                     nextGDPA(*out, "vkCreateGraphicsPipelines");
@@ -336,7 +295,7 @@ index 2d5613e..d0786ed 100644
      GD(createFence, CreateFence);                 GD(resetFences, ResetFences);  GD(waitForFences, WaitForFences);
      GD(queueSubmit, QueueSubmit);                 GD(getDeviceQueue, GetDeviceQueue);
      GD(destroyPipeline, DestroyPipeline);         GD(destroyPipelineLayout, DestroyPipelineLayout);
-@@ -20414,6 +20554,7 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
+@@ -20414,6 +20529,7 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
      RETURN_IF("vkCmdCopyImage",        TAA_CmdCopyImage)
      RETURN_IF("vkCmdClearColorImage",  TAA_CmdClearColorImage)
      RETURN_IF("vkCreateShaderModule",   TAA_CreateShaderModule)
@@ -345,7 +304,7 @@ index 2d5613e..d0786ed 100644
      RETURN_IF("vkCmdDispatch",          TAA_CmdDispatch)
      RETURN_IF("vkCmdPushDescriptorSetKHR", TAA_CmdPushDescriptorSetKHR)
 diff --git a/src/vklayer/taa.h b/src/vklayer/taa.h
-index 642f247..489ecc8 100644
+index 642f247..8cab6b0 100644
 --- a/src/vklayer/taa.h
 +++ b/src/vklayer/taa.h
 @@ -41,6 +41,7 @@
@@ -356,32 +315,39 @@ index 642f247..489ecc8 100644
  
  struct TaaState {
      VkDevice        device      = VK_NULL_HANDLE;
-@@ -1666,6 +1667,80 @@ static void taaRecordMetrics(DeviceData &dd, VkCommandBuffer cb)
+@@ -1666,6 +1667,83 @@ static void taaRecordMetrics(DeviceData &dd, VkCommandBuffer cb)
      metrics::record(dd, g_taa.device, mi);
  }
  
-+// ---- FSCAA LAYER 1: CMAA2 BEFORE THE RESOLVE (taa.backend=fscaa, fscaa.h).
-+// In place on X-Plane's scene when Layer_CreateImage made it storage-capable (no copy, no extra
-+// image); otherwise on a copy that the resolve then samples as uScene. Either way the history
-+// accumulates edge-cleaned frames. Layer 2 (class caps) is in taa.comp, driven by slots 32-39.
++// ---- FSCAA LAYER 1: CMAA2 AFTER THE RESOLVE (taa.backend=fscaa, fscaa.h).
++// It cleans the frame being DELIVERED - never the history, never the resolve's input. Its first home
++// was before the resolve, on the jittered frame: there it judged each frame's edges at a different
++// sub-pixel offset, its blends changed from frame to frame, and the resolve's colour clamp threw
++// history away over them - far runway markings and terminal edges flickered (first live run,
++// 2026-10-15). On the resolved frame its input is stable, and it only finds work where history could
++// not do it: class-capped pixels and disocclusions. In place on the sharpen target (ours, already
++// STORAGE) when the sharpen runs; otherwise on a copy, because the delivery source is then the
++// history itself. Returns the image the copy-out should deliver - src (in place), the cleaned copy
++// (left in SHADER_READ_ONLY_OPTIMAL), or VK_NULL_HANDLE when CMAA2 did not run. Layer 2 (class caps)
++// is in taa.comp, driven by slots 32-39.
 +static cmaa2::Fns   g_cmaaFns;
 +static cmaa2::State g_cmaa;
-+static std::mutex   g_cmaaMtx;          // the in-place view cache is also touched by Layer_DestroyImage
++static std::mutex   g_cmaaMtx;
 +static bool         g_cmaaFnsOk = false, g_cmaaFailed = false;
-+static VkImageView  g_fscaaSceneView = VK_NULL_HANDLE;   // copy mode: the cleaned copy, for uScene
 +static uint64_t     g_fscaaFrame = 0;
 +static uint32_t     g_fscaaCtr[16] = {};
 +
-+static void fscaaRecordCmaa(DeviceData &dd, VkCommandBuffer cb)
++static VkImage fscaaRecordCmaa(DeviceData &dd, VkCommandBuffer cb, VkImage src, bool srcIsScratch)
 +{
-+    g_fscaaSceneView = VK_NULL_HANDLE;
 +    const fscaa::Settings s = fscaa::read();
-+    if (!s.on) return;
++    if (!s.on) return VK_NULL_HANDLE;
 +    ++g_fscaaFrame;
 +    const bool statsFrame = s.statsEvery > 0 && (g_fscaaFrame % (uint64_t)s.statsEvery) == 0;
-+    bool ran = false;
++    VkImage out = VK_NULL_HANDLE;
 +    if (!(s.layers & fscaa::kCmaa)) fscaa::skipOnce("fscaa.layers excludes CMAA2 (bit 1)");
 +    else if (g_taa.layers != 1)    fscaa::skipOnce("multi-layer (VR) scene - FSCAA is single-view only");
++    else if (!src)                 fscaa::skipOnce("no delivery image this frame");
++    else if (g_taa.format != VK_FORMAT_R16G16B16A16_SFLOAT) fscaa::skipOnce("scene is not RGBA16F - CMAA2's views are built for that format");
 +    else if (!g_cmaaFailed) {
 +        std::lock_guard<std::mutex> g(g_cmaaMtx);
 +        if (!g_cmaaFnsOk) {
@@ -390,65 +356,60 @@ index 642f247..489ecc8 100644
 +            g_cmaaFnsOk = dd.gdpa && cmaa2::loadFns(g_cmaaFns, dd.gdpa, g_taa.device, mp);
 +            if (!g_cmaaFnsOk) { g_cmaaFailed = true; fscaa::skipOnce("CMAA2 entry points missing"); }
 +        }
-+        const bool inplace = fscaa::sceneHasStorage(g_taa.sceneImage);
-+        if (g_cmaaFnsOk && (g_cmaa.w != g_taa.w || g_cmaa.h != g_taa.h || !g_cmaa.pl || g_cmaa.ownColor == inplace)) {
-+            if (g_cmaa.dev && dd.deviceWaitIdle) dd.deviceWaitIdle(g_taa.device);   // resize: nothing in flight may use the old set
++        const bool inplace = srcIsScratch;
++        // The sharpen target is rebuilt with the rest of the TAA state (resize, flight change), so a
++        // view cached on the previous one is stale. Rare: wait for idle and start clean.
++        const bool stale = inplace && !g_cmaa.ext.empty() && !g_cmaa.ext.count(src);
++        if (g_cmaaFnsOk && (g_cmaa.w != g_taa.w || g_cmaa.h != g_taa.h || !g_cmaa.pl || g_cmaa.ownColor == inplace || stale)) {
++            if (g_cmaa.dev && dd.deviceWaitIdle) dd.deviceWaitIdle(g_taa.device);   // nothing in flight may use the old set
 +            if (!cmaa2::create(g_cmaaFns, g_cmaa, g_taa.device, g_taa.w, g_taa.h, !inplace)) {
 +                g_cmaaFailed = true;
 +                trace("FSCAA: CMAA2 resources for %ux%u FAILED - running the class caps without it", g_taa.w, g_taa.h);
 +            } else {
-+                trace("FSCAA: CMAA2 ready at %ux%u, %s, %.1f MB", g_taa.w, g_taa.h,
-+                      inplace ? "IN PLACE on X-Plane's scene target (no copy)" : "copy mode (scene not storage-capable)",
++                trace("FSCAA: CMAA2 ready at %ux%u after the resolve, %s, %.1f MB", g_taa.w, g_taa.h,
++                      inplace ? "in place on the sharpen target" : "on a copy (sharpen off: the delivery is the history)",
 +                      cmaa2::bytes(g_cmaa) / 1048576.0);
 +            }
 +        }
 +        if (g_cmaaFnsOk && !g_cmaaFailed) {
 +            if (statsFrame) cmaa2::readCounters(g_cmaa, g_fscaaCtr);   // the copy recorded on the previous stats frame
 +            gpuTimeMark(dd, cb, "cmaa2");
++            bool ran;
 +            if (inplace) {
-+                ran = cmaa2::recordInPlace(g_cmaaFns, g_cmaa, cb, g_taa.sceneImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-+                                           s.cmaaPreset, s.debugEdges);
-+                if (!ran) fscaa::skipOnce("in-place record refused (more distinct scene targets than cached)");
++                ran = cmaa2::recordInPlace(g_cmaaFns, g_cmaa, cb, src, VK_IMAGE_LAYOUT_GENERAL, s.cmaaPreset, s.debugEdges);
++                if (ran) out = src; else fscaa::skipOnce("in-place record refused");
 +            } else {
-+                ran = cmaa2::record(g_cmaaFns, g_cmaa, cb, g_taa.sceneImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-+                                    s.cmaaPreset, s.debugEdges);
-+                if (ran) g_fscaaSceneView = g_cmaa.colorArrayView;
-+                else fscaa::skipOnce("copy-mode record refused");
++                ran = cmaa2::record(g_cmaaFns, g_cmaa, cb, src, VK_IMAGE_LAYOUT_GENERAL, s.cmaaPreset, s.debugEdges);
++                if (ran) out = g_cmaa.color; else fscaa::skipOnce("copy-mode record refused");
 +            }
 +            if (ran && statsFrame) cmaa2::recordCounterCopy(g_cmaaFns, g_cmaa, cb);
 +        }
 +    }
-+    if (statsFrame) fscaa::frameStats(s, g_fscaaFrame, ran, g_fscaaCtr, cmaa2::bytes(g_cmaa), g_taa.w, g_taa.h);
-+}
-+
-+static void fscaaForgetImage(VkImage img)
-+{
-+    std::lock_guard<std::mutex> g(g_cmaaMtx);
-+    if (g_cmaaFnsOk && g_cmaa.dev) cmaa2::forget(g_cmaaFns, g_cmaa, img);
++    if (statsFrame) fscaa::frameStats(s, g_fscaaFrame, out != VK_NULL_HANDLE, g_fscaaCtr, cmaa2::bytes(g_cmaa), g_taa.w, g_taa.h);
++    return out;
 +}
 +
 +static void fscaaShutdown()
 +{
 +    std::lock_guard<std::mutex> g(g_cmaaMtx);
 +    if (g_cmaaFnsOk && g_cmaa.dev) cmaa2::destroy(g_cmaaFns, g_cmaa);
-+    g_cmaaFnsOk = false; g_cmaaFailed = false; g_fscaaSceneView = VK_NULL_HANDLE;
++    g_cmaaFnsOk = false; g_cmaaFailed = false;
 +}
 +
  static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                               float jitterX, float jitterY, bool reset,
                               bool cameraMoved)
-@@ -1838,6 +1913,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -1838,6 +1916,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                                0, nullptr, 0, nullptr, nHist, hist);
      }
  
 +    // FSCAA layer 1: the scene is now in SHADER_READ_ONLY_OPTIMAL (bar[0] above), which is the
 +    // layout cmaa2 expects and restores. Off unless taa.backend=fscaa.
-+    if (!dlaaRun) fscaaRecordCmaa(dd, cb);
 +
      // ---- THE GATHER, AFTER THE TRANSITIONS AND BEFORE THE RESOLVE.
      //
      // It must come after the barriers above, not before them: bar[0] moves the
-@@ -2070,11 +2149,24 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -2070,6 +2151,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
          const bool hdBound = g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE;
          slot[30] = (hdBound && !dlaaRun && live::onoff("taa.disocc_reset", "TAA_DISOCC_RESET", true)) ? 1.0f : 0.0f;
          slot[31] = hdBound ? 1.0f : 0.0f;
@@ -468,9 +429,60 @@ index 642f247..489ecc8 100644
      }
  
      VkDescriptorImageInfo ii[8];
-     memset(ii, 0, sizeof(ii));
--    ii[0].imageView = g_taa.sceneView;
-+    ii[0].imageView = g_fscaaSceneView ? g_fscaaSceneView : g_taa.sceneView;   // FSCAA copy mode: the cleaned copy
-     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-     ii[0].sampler   = g_taa.sampler;
-     ii[1].imageView = g_taa.historyView[hw_]; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+@@ -2610,12 +2704,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+     // Separate command, explicit ordering: everything the dispatch reads is
+     // finished before anything is written back. In place would reintroduce the
+     // neighbourhood race the read-only binding just removed.
++    // The sharpen wrote g_taa.sharpImage; deliver THAT and leave the resolved
++    // history[hw_] untouched (it stays pristine as next frame's sample source).
++    // Without the sharpen, deliver history[hw_] as before.
++    VkImage       deliverSrc    = doSharpen ? g_taa.sharpImage : (nnFinImg != VK_NULL_HANDLE ? nnFinImg : g_taa.history[hw_]);
++    VkImageLayout deliverLayout = VK_IMAGE_LAYOUT_GENERAL;
++    // ---- FSCAA LAYER 1: CMAA2 on the image about to be delivered (fscaaRecordCmaa).
++    if (!dlaaRun) {
++        const VkImage cleaned = fscaaRecordCmaa(dd, cb, deliverSrc, doSharpen);
++        if (cleaned != VK_NULL_HANDLE && cleaned != deliverSrc) {
++            deliverSrc = cleaned; deliverLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++        }
++    }
++
+     gpuTimeMark(dd, cb, "copy");
+     {
+-        // The sharpen wrote g_taa.sharpImage; copy THAT to screen and leave the
+-        // resolved history[hw_] untouched (it stays pristine as next frame's
+-        // sample source). Without the sharpen, copy history[hw_] as before.
+-        VkImage copySrc = doSharpen ? g_taa.sharpImage : (nnFinImg != VK_NULL_HANDLE ? nnFinImg : g_taa.history[hw_]);
++        VkImage copySrc = deliverSrc;
+         // DLAA: deliver DLSS's output. If it did not run this frame, keep the barriers
+         // (history[hw_] is GENERAL like any copy source) but skip the copy itself, so the
+         // raw scene stays on screen instead of the prep pass's motion vectors.
+@@ -2632,7 +2736,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+         pre[1].image = copySrc;
+         pre[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+         pre[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+-        pre[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++        pre[1].oldLayout = copySrc == deliverSrc ? deliverLayout : VK_IMAGE_LAYOUT_GENERAL;
+         pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+         dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+@@ -2661,6 +2765,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+         // copySrc is GENERAL again. For the sharpen target that is the state the
+         // next frame's pre-dispatch barrier expects; record it.
+         if (doSharpen) g_taa.sharpLayout = VK_IMAGE_LAYOUT_GENERAL;
++        if (copySrc == g_cmaa.color) g_cmaa.colorLayout = VK_IMAGE_LAYOUT_GENERAL;   // FSCAA copy mode
+     }
+ 
+     // The destination stage for this transition back is COLOR_ATTACHMENT_OUTPUT
+@@ -2718,9 +2823,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+         // states outright that a difference means the copy is not reaching the
+         // display, and that conclusion was false every time it was read.
+         //
+-        // Same expression as copySrc so the two cannot drift apart again.
+-        const VkImage probeSrc = doSharpen ? g_taa.sharpImage
+-                                           : g_taa.history[hw_];
++        // The same variable the copy-out used, so the two cannot drift apart
++        // again (FSCAA's CMAA2 may have swapped in its cleaned copy).
++        const VkImage probeSrc = deliverSrc;
+         rb.image = probeSrc;
+         rb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+         rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

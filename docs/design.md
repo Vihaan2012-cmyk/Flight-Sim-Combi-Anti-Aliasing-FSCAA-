@@ -32,6 +32,23 @@ Out of scope:
 - GBAA: marginal gain over CMAA2 + TAA.
 - DLAA and DLDSR: these are separate backends or driver features.
 
+## Revision 2026-10-15: CMAA2 moved after the resolve
+
+The first live run put CMAA2 before the resolve, on the jittered frame, as described below. That was
+wrong. CMAA2 judged each frame's edges at a different sub-pixel offset, so its blends changed from frame to
+frame, and the resolve's colour clamp threw history away over them. Far runway markings and terminal
+edges flickered.
+
+CMAA2 now cleans only the delivered frame. It never touches the history or the resolve's input. It runs
+in place on the layer's sharpen target (RGBA16F, already STORAGE), or on a copy when sharpening is off,
+because the delivery source is then the history itself. X-Plane's images are no longer given STORAGE
+usage. The target the resolve latches was never one of the images that got it, which is why the first
+run fell back to copy mode.
+
+`fscaa.keep_near` now defaults to 1.0. At 0.5, near edges kept half the per-frame jitter.
+
+The sections below record the original design.
+
 ## Phase 1 architecture (CMAA2 + class-weighted TAA)
 
 Per frame, inside `taaRecordResolve` (`src/vklayer/taa.h`), when `taa.backend=fscaa` and there is
