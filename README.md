@@ -55,7 +55,8 @@ Phase 1 settings (all live, no restart):
 ## Documents
 
 - [Design](docs/design.md): the architecture, why each layer is there, risks, and testing
-- [Phase 1 plan](docs/plans/phase1-cmaa2-class-taa.md): CMAA2 + class-weighted TAA, task by task
+- [Full build plan](docs/plans/full-build.md): all six layers + the debugging toolkit, task by task
+- [Phase 1 detail](docs/plans/phase1-cmaa2-class-taa.md): CMAA2 + class-weighted TAA, step by step
 
 ## Target
 
