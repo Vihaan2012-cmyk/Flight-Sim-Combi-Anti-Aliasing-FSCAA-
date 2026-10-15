@@ -29,7 +29,7 @@ enum : uint32_t { kCmaa = 1, kCaps = 2, kWire = 4, kLight = 8, kSpecular = 16, k
 struct Settings {
     bool on = false;             // taa.backend == fscaa
     uint32_t layers = kAll;      // fscaa.layers bitmask
-    int cmaaPreset = 2;          // fscaa.cmaa_preset 0..3
+    int cmaaPreset = 3;          // fscaa.cmaa_preset 0..3 (3 ULTRA: closest to the truth after the sharpen, tools/nn/sharpen_eval.py --cmaa)
     float nearM = 80.0f, keepNear = 1.0f, keepScreen = 0.0f, keepLight = 1.0f;
     bool debugEdges = false;     // fscaa.debug_edges: CMAA2's edge overlay, live
     int statsEvery = 600;        // fscaa.stats_every, frames (0 = off)
@@ -42,7 +42,7 @@ inline Settings read()
     std::string be;
     s.on = live::lookup("taa.backend", be) && be == "fscaa";
     s.layers = (uint32_t)live::i("fscaa.layers", nullptr, (int)kAll) & kAll;
-    s.cmaaPreset = live::i("fscaa.cmaa_preset", nullptr, 2);
+    s.cmaaPreset = live::i("fscaa.cmaa_preset", nullptr, 3);
     if (s.cmaaPreset < 0) s.cmaaPreset = 0;
     if (s.cmaaPreset > 3) s.cmaaPreset = 3;
     s.nearM = live::f("fscaa.near_m", nullptr, 80.0f);

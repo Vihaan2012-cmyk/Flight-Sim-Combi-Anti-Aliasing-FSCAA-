@@ -54,7 +54,7 @@ index 3264c62..cb47b54 100644
  $ncTmp = Join-Path $env:TEMP "nn_conv.spv"
  & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/nn_conv.comp" -o $ncTmp | Out-Null
 diff --git a/src/shaders/taa.comp b/src/shaders/taa.comp
-index 319da58..e9152b3 100644
+index 319da58..d6579c8 100644
 --- a/src/shaders/taa.comp
 +++ b/src/shaders/taa.comp
 @@ -135,6 +135,10 @@ layout(binding = 6, std140) uniform ReprojData {
@@ -76,7 +76,39 @@ index 319da58..e9152b3 100644
                                 // yes, BLACK no. Ungated by every other
                                 // setting, deliberately: VIZ_MOTION zeroes the
                                 // unwritten sentinel, so "nothing wrote here"
-@@ -2210,6 +2215,25 @@ void main()
+@@ -958,8 +963,29 @@ void main()
+         // The defect being fixed was that sharpen could not tell a converged
+         // pixel from a freshly disoccluded one. Confidence answers that. Motion
+         // is a different question and did not need answering.
+-        float amt  = pc.sharpen * conf;
+-        vec3 sharp = e + amt * (4.0 * e - up - dn - lf - rt);
++        // ---- CONTRAST-ADAPTIVE (AMD FidelityFX CAS), NOT A FIXED LAPLACIAN.
++        //
++        // This was e + amt * (4e - up - dn - lf - rt) at the same strength everywhere. On an
++        // anti-aliased edge that pushes the partly-covered pixels towards one side until the clamp
++        // stops them, which is the stair-step the resolve had just removed. MEASURED against the
++        // burst-accumulated multi-sample truth (tools/nn/sharpen_eval.py, 20 bursts, 2026-10-16):
++        // at 0.5 it added 13% error on geometric edges and overshot texture detail to 1.30x the
++        // truth's. CAS lowers its weight where the local range is already wide (edges) and keeps it on
++        // texture: at full strength it adds 4% on edges for 1.18x detail. The weight is computed on
++        // tonemapped values (the scene can exceed 1) and applied to the linear colour.
++        // taa.sharpen 0.5 is CAS at full strength (the old default's crispness); 0.25 is half.
++        vec3 ul = texelFetch(uHistorySampler, ivec3(clamp(px + ivec2(-1, -1), ivec2(0), hi2), layer), 0).rgb;
++        vec3 ur = texelFetch(uHistorySampler, ivec3(clamp(px + ivec2( 1, -1), ivec2(0), hi2), layer), 0).rgb;
++        vec3 dl = texelFetch(uHistorySampler, ivec3(clamp(px + ivec2(-1,  1), ivec2(0), hi2), layer), 0).rgb;
++        vec3 dr = texelFetch(uHistorySampler, ivec3(clamp(px + ivec2( 1,  1), ivec2(0), hi2), layer), 0).rgb;
++        vec3 tB = tm(up), tD = tm(lf), tE = tm(e), tF = tm(rt), tH = tm(dn);
++        vec3 mnC = min(min(min(tD, tE), min(tF, tB)), tH);
++        vec3 mxC = max(max(max(tD, tE), max(tF, tB)), tH);
++        vec3 mnS = mnC + min(mnC, min(min(tm(ul), tm(ur)), min(tm(dl), tm(dr))));
++        vec3 mxS = mxC + max(mxC, max(max(tm(ul), tm(ur)), max(tm(dl), tm(dr))));
++        vec3 amp = sqrt(clamp(min(mnS, 2.0 - mxS) / max(mxS, vec3(1e-6)), 0.0, 1.0));
++        vec3 w   = amp * (-1.0 / mix(8.0, 5.0, clamp(2.0 * pc.sharpen, 0.0, 1.0))) * conf;
++        vec3 sharp = (up * w + dn * w + lf * w + rt * w + e) / (1.0 + 4.0 * w);
+         sharp = clamp(sharp, lo, hi);
+         imageStore(uHistory, ivec3(px, layer), vec4(max(sharp, vec3(0.0)), 1.0));
+         return;
+@@ -2210,6 +2236,25 @@ void main()
          if (uReprojParams.w >= 1.0) currA = curr;
      }
  

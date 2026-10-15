@@ -47,7 +47,7 @@ Settings live in `%TEMP%\taa_live.ini`.
 | Key | Default | Meaning |
 |---|---|---|
 | `fscaa.layers` | 63 | bitmask: 1 CMAA2, 2 class caps, 4 wire, 8 light, 16 specular, 32 alpha (bits 4–32 latch at load) |
-| `fscaa.cmaa_preset` | 2 | CMAA2 edge threshold: 0 LOW … 3 ULTRA |
+| `fscaa.cmaa_preset` | 3 | CMAA2 edge threshold: 0 LOW … 3 ULTRA |
 | `fscaa.near_m` | 80 | distance treated as "your aircraft / cockpit" |
 | `fscaa.keep_near` | 1.0 | how much history near geometry may keep (below 1, near edges show the jitter) |
 | `fscaa.keep_screen` | 0.0 | history on cockpit screens (0 = none, no ghosting) |
@@ -82,6 +82,26 @@ The trace also logs `FSCAA PATCH:` lines with how many shaders each layer rewrot
 | Shader rewrites over all 6,775 X-Plane 12.4.4 variants (`tools/fscaa_validate.sh`) | wire 2, light 4, specular 960, alpha 3,724 patched; every output `spirv-val` valid |
 | Runtime hash vs generated tables (`tools/fscaa_table_test.cpp`) | 5,617 / 5,617 modules found |
 | MotionVectors' own shader injection on top of FSCAA (`tools/fscaa_inject_test.cpp`) | 0 regressions; 1,436 injected modules `spirv-val` valid |
+
+## Image quality against a multi-sample truth (2026-10-16)
+
+`tools/bench/sharpen_eval.py` scores the post-resolve pipeline against a truth accumulated from bursts of
+jittered frames (20 bursts, native 2560x1440, captured 2026-09-11). Error is mean |x - truth| in
+tonemapped space, x1000, lower is better. Detail is the texture-region Laplacian energy relative to the
+truth's: below 1 is softer than the truth.
+
+| Delivered image | Edge error | All pixels | Detail |
+|---|---|---|---|
+| TAA resolve alone | 36.19 | 8.04 | 0.88 |
+| Laplacian sharpen 0.5 + CMAA2 HIGH (first FSCAA build) | 38.46 | 8.70 | 1.24 |
+| **CAS sharpen + CMAA2 ULTRA (current)** | **36.61** | **8.38** | **1.11** |
+
+The TAA resolve alone is soft. A fixed Laplacian sharpen restores detail but re-stairs the edges: on its
+own it adds 13% edge error. CAS adapts its strength to local contrast. CMAA2 then removes what the sharpen
+re-stairs; on the resolve's own output it changes almost nothing. `tools/cmaa2_file.cpp` runs the shipped
+CMAA2 kernels on a captured frame for this bench.
+
+GPU cost in flight (2560x1440, RTX 4060): resolve 1.46 ms, sharpen 0.21 ms, CMAA2 0.19 ms, copy 0.09 ms.
 
 ## Documents
 
