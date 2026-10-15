@@ -54,21 +54,22 @@ index 3264c62..cb47b54 100644
  $ncTmp = Join-Path $env:TEMP "nn_conv.spv"
  & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/nn_conv.comp" -o $ncTmp | Out-Null
 diff --git a/src/shaders/taa.comp b/src/shaders/taa.comp
-index 319da58..d6579c8 100644
+index 319da58..b073d5b 100644
 --- a/src/shaders/taa.comp
 +++ b/src/shaders/taa.comp
-@@ -135,6 +135,10 @@ layout(binding = 6, std140) uniform ReprojData {
+@@ -135,6 +135,11 @@ layout(binding = 6, std140) uniform ReprojData {
      // z: disocclusion reset (taa.disocc_reset), w: the depth history is really bound at 13/14
      //    (when it is not, binding 14 aliases the colour history and must never be written)
      vec4 uReprojParams4;
 +    // FSCAA (taa.backend=fscaa, layer 2): x on, y fscaa.near_m. Slots 32-35.
++    // z: taa.hist_lanczos - the accumulation fetch uses Lanczos-3 (every backend, not only FSCAA).
 +    vec4 uFscaa;
 +    // FSCAA history caps: x fscaa.keep_screen, y fscaa.keep_near, z fscaa.keep_light. Slots 36-39.
 +    vec4 uFscaa2;
  };
  
  // ---- THE ENGINE'S SUN, ASKED DIRECTLY.
-@@ -572,6 +576,7 @@ const int VIZ_WRITTEN   = 8;   // did ANY shader write velocity here - WHITE
+@@ -572,6 +577,7 @@ const int VIZ_WRITTEN   = 8;   // did ANY shader write velocity here - WHITE
  const int VIZ_SUNVIS    = 9;   // engine-cascade sun visibility per pixel
  const int VIZ_PROBE     = 10;  // engine cubemap radiance along the view ray
  const int VIZ_GI        = 11;  // the gathered bounce, relative to the pixel's own luminance
@@ -76,7 +77,73 @@ index 319da58..d6579c8 100644
                                 // yes, BLACK no. Ungated by every other
                                 // setting, deliberately: VIZ_MOTION zeroes the
                                 // unwritten sentinel, so "nothing wrote here"
-@@ -958,8 +963,29 @@ void main()
+@@ -708,6 +714,65 @@ vec3  tm(vec3 c)   { return c / (1.0 + luma(c)); }
+ // The negative lobes can ring into negative values on a high-contrast edge.
+ // The caller already floors the stored result at zero, and the clamp box
+ // bounds it besides, so ringing cannot survive into history.
++//
++// ---- LANCZOS-3 FOR THE ACCUMULATION FETCH (taa.hist_lanczos, uFscaa.z).
++//
++// Catmull-Rom still loses detail on every resample, and twenty resamples
++// compound: the livery crawl in chase view. The chase camera sways the airframe
++// by a sub-pixel amount every frame, so its history is resampled at a new
++// fractional offset each frame, washed out, and rebuilt unevenly from the
++// jittered samples. MEASURED (tools/nn/crawl_bench.py: a synthetic livery with
++// 0.6-2 px text strokes, 0.3 px panel lines and sub-pixel rivet highlights, the
++// resolve's own rejection rule, 0.3 px of spring sway): Catmull-Rom error 18.1 and
++// crawl 10.2; Lanczos-3 clamped to the 2x2 source texels, 13.4 and 9.0. That is
++// -26% and -12%, and -27% / -12% with vectors 20% off. A parked image is identical
++// (zero offset is an identity for both). Lanczos-2 is no better than Catmull-Rom.
++// The clamp to the four texels around the sample is FSR's de-ringing: the wider
++// lobes ring more, and the 2x2 range is what the sample could legitimately be.
++// Taps -2..3 per axis; 0 and 1 are both positive on [0,1) and share one bilinear
++// fetch, so 25 fetches plus 4 for the clamp.
++float lanczos3(float x)
++{
++    x = abs(x);
++    if (x < 1e-5) return 1.0;
++    if (x >= 3.0) return 0.0;
++    float p = 3.14159265 * x;
++    return 3.0 * sin(p) * sin(p / 3.0) / (p * p);
++}
++
++vec3 sampleHistoryLanczos3(vec2 uv, float layer, vec2 tsz)
++{
++    vec2 samplePos = uv * tsz;
++    vec2 tc = floor(samplePos - 0.5) + 0.5;   // centre of tap 0, at or before the sample
++    vec2 f  = samplePos - tc;                 // [0, 1)
++    vec2 w[6];
++    vec2 sum = vec2(0.0);
++    for (int k = 0; k < 6; ++k) {
++        w[k] = vec2(lanczos3(f.x - float(k - 2)), lanczos3(f.y - float(k - 2)));
++        sum += w[k];
++    }
++    for (int k = 0; k < 6; ++k) w[k] /= sum;
++    // five fetch positions per axis: -2, -1, merged {0,1}, 2, 3
++    vec2 W[5]; vec2 P[5];
++    W[0] = w[0]; P[0] = tc - 2.0;
++    W[1] = w[1]; P[1] = tc - 1.0;
++    W[2] = w[2] + w[3]; P[2] = tc + w[3] / max(W[2], vec2(1e-6));
++    W[3] = w[4]; P[3] = tc + 2.0;
++    W[4] = w[5]; P[4] = tc + 3.0;
++    vec3 r = vec3(0.0);
++    for (int j = 0; j < 5; ++j)
++        for (int i = 0; i < 5; ++i)
++            r += texture(uHistorySampler, vec3(P[i].x / tsz.x, P[j].y / tsz.y, layer)).rgb * (W[i].x * W[j].y);
++    ivec2 hi = ivec2(tsz) - 1;
++    ivec2 i0 = clamp(ivec2(tc - 0.5), ivec2(0), hi);
++    ivec2 i1 = clamp(i0 + 1, ivec2(0), hi);
++    vec3 a = texelFetch(uHistorySampler, ivec3(i0.x, i0.y, int(layer)), 0).rgb;
++    vec3 b = texelFetch(uHistorySampler, ivec3(i1.x, i0.y, int(layer)), 0).rgb;
++    vec3 c = texelFetch(uHistorySampler, ivec3(i0.x, i1.y, int(layer)), 0).rgb;
++    vec3 d = texelFetch(uHistorySampler, ivec3(i1.x, i1.y, int(layer)), 0).rgb;
++    return max(clamp(r, min(min(a, b), min(c, d)), max(max(a, b), max(c, d))), vec3(0.0));
++}
++
+ vec3 sampleHistory(vec2 uv, float layer, vec2 tsz)
+ {
+     if ((pc.flags & FLAG_CATMULL) == 0)
+@@ -958,8 +1023,29 @@ void main()
          // The defect being fixed was that sharpen could not tell a converged
          // pixel from a freshly disoccluded one. Confidence answers that. Motion
          // is a different question and did not need answering.
@@ -108,7 +175,18 @@ index 319da58..d6579c8 100644
          sharp = clamp(sharp, lo, hi);
          imageStore(uHistory, ivec3(px, layer), vec4(max(sharp, vec3(0.0)), 1.0));
          return;
-@@ -2210,6 +2236,25 @@ void main()
+@@ -1756,7 +1842,9 @@ void main()
+         return;
+     }
+ 
+-    vec3 hist = sampleHistory(hUv, float(layer), vec2(size));
++    vec3 hist = ((pc.flags & FLAG_CATMULL) != 0 && uFscaa.z > 0.5)
++              ? sampleHistoryLanczos3(hUv, float(layer), vec2(size))   // taa.hist_lanczos (see sampleHistory)
++              : sampleHistory(hUv, float(layer), vec2(size));
+     if ((pc.flags & FLAG_NN) != 0)
+         nnEmit(px, layer, size, uv, nnBase, nnBase * (currA / max(currRaw, vec3(1e-4))), S, velS, hUv, hist, 1.0);
+     // ---- EXPERIMENTAL (taa.conf_exp): how many samples does this history hold, and is
+@@ -2210,6 +2298,25 @@ void main()
          if (uReprojParams.w >= 1.0) currA = curr;
      }
  
@@ -336,7 +414,7 @@ index 2d5613e..a7c8ebe 100644
      RETURN_IF("vkCmdDispatch",          TAA_CmdDispatch)
      RETURN_IF("vkCmdPushDescriptorSetKHR", TAA_CmdPushDescriptorSetKHR)
 diff --git a/src/vklayer/taa.h b/src/vklayer/taa.h
-index 642f247..8cab6b0 100644
+index 642f247..21f7faa 100644
 --- a/src/vklayer/taa.h
 +++ b/src/vklayer/taa.h
 @@ -41,6 +41,7 @@
@@ -441,7 +519,7 @@ index 642f247..8cab6b0 100644
      // ---- THE GATHER, AFTER THE TRANSITIONS AND BEFORE THE RESOLVE.
      //
      // It must come after the barriers above, not before them: bar[0] moves the
-@@ -2070,6 +2151,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -2070,6 +2151,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
          const bool hdBound = g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE;
          slot[30] = (hdBound && !dlaaRun && live::onoff("taa.disocc_reset", "TAA_DISOCC_RESET", true)) ? 1.0f : 0.0f;
          slot[31] = hdBound ? 1.0f : 0.0f;
@@ -452,7 +530,10 @@ index 642f247..8cab6b0 100644
 +            const bool caps = fs.on && (fs.layers & fscaa::kCaps) && g_taa.layers == 1 && !dlaaRun;
 +            slot[32] = caps ? 1.0f : 0.0f;
 +            slot[33] = fs.nearM;
-+            slot[34] = 0.0f; slot[35] = 0.0f;
++            // uFscaa.z serves every backend: taa.hist_lanczos, the Lanczos-3 accumulation fetch
++            // (taa.comp, sampleHistoryLanczos3). 0 = the previous Catmull-Rom, for A/B.
++            slot[34] = live::onoff("taa.hist_lanczos", "TAA_HIST_LANCZOS", true) ? 1.0f : 0.0f;
++            slot[35] = 0.0f;
 +            slot[36] = fs.keepScreen;
 +            slot[37] = fs.keepNear;
 +            slot[38] = fs.keepLight;
@@ -461,7 +542,7 @@ index 642f247..8cab6b0 100644
      }
  
      VkDescriptorImageInfo ii[8];
-@@ -2610,12 +2704,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -2610,12 +2707,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
      // Separate command, explicit ordering: everything the dispatch reads is
      // finished before anything is written back. In place would reintroduce the
      // neighbourhood race the read-only binding just removed.
@@ -488,7 +569,7 @@ index 642f247..8cab6b0 100644
          // DLAA: deliver DLSS's output. If it did not run this frame, keep the barriers
          // (history[hw_] is GENERAL like any copy source) but skip the copy itself, so the
          // raw scene stays on screen instead of the prep pass's motion vectors.
-@@ -2632,7 +2736,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -2632,7 +2739,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
          pre[1].image = copySrc;
          pre[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
          pre[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -497,7 +578,7 @@ index 642f247..8cab6b0 100644
          pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
          dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-@@ -2661,6 +2765,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -2661,6 +2768,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
          // copySrc is GENERAL again. For the sharpen target that is the state the
          // next frame's pre-dispatch barrier expects; record it.
          if (doSharpen) g_taa.sharpLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -505,7 +586,7 @@ index 642f247..8cab6b0 100644
      }
  
      // The destination stage for this transition back is COLOR_ATTACHMENT_OUTPUT
-@@ -2718,9 +2823,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
+@@ -2718,9 +2826,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
          // states outright that a difference means the copy is not reaching the
          // display, and that conclusion was false every time it was read.
          //
